@@ -97,3 +97,23 @@ func TestCopyMissingKeepsExistingFiles(t *testing.T) {
 		t.Fatalf("missing default was not copied: %v", err)
 	}
 }
+
+func TestExtractKeepsHardLinksInside(t *testing.T) {
+	t.Parallel()
+	dst := t.TempDir()
+	buf := tarWith(t, []tar.Header{
+		{Name: "node_modules/esbuild/bin/esbuild", Typeflag: tar.TypeReg, Mode: 0o755},
+		{Name: "node_modules/@esbuild/bin/esbuild", Typeflag: tar.TypeLink, Linkname: "node_modules/esbuild/bin/esbuild"},
+	}, map[string]string{"node_modules/esbuild/bin/esbuild": "bin"})
+	if err := extractTar(buf, dst); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "node_modules/@esbuild/bin/esbuild"))
+	if err != nil || string(got) != "bin" {
+		t.Fatalf("hard link content = %q, %v", got, err)
+	}
+	outside := tarWith(t, []tar.Header{{Name: "x", Typeflag: tar.TypeLink, Linkname: "../../etc/passwd"}}, nil)
+	if err := extractTar(outside, t.TempDir()); err == nil {
+		t.Fatal("hard link that leaves the directory was accepted")
+	}
+}

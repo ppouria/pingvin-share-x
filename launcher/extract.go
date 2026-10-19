@@ -35,6 +35,17 @@ func extractTar(r io.Reader, dst string) error {
 			if err := writeFile(target, tr, fs.FileMode(hdr.Mode).Perm()|0o600); err != nil {
 				return err
 			}
+		case tar.TypeLink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			source := safeJoin(dst, hdr.Linkname)
+			if source != dst && !strings.HasPrefix(source, dst+string(os.PathSeparator)) {
+				return fmt.Errorf("payload hard link %s leaves the install directory", hdr.Linkname)
+			}
+			if err := os.Link(source, target); err != nil {
+				return err
+			}
 		case tar.TypeSymlink:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err

@@ -204,6 +204,7 @@ func childEnv(base, data string) []string {
 	return append(env,
 		"NODE_ENV=production",
 		"BACKEND_PORT="+backendPort,
+		"BACKEND_HOST=127.0.0.1",
 		"DATA_DIRECTORY="+data,
 		"DATABASE_URL=file:"+filepath.Join(data, "pingvin-share.db")+"?connection_limit=1",
 		"CONFIG_FILE="+filepath.Join(base, "config.yaml"),
