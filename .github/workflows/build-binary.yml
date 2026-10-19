@@ -1,0 +1,133 @@
+# Builds the Pingvin Share X launcher for linux/amd64 and linux/arm64 on native runners.
+# Each binary embeds Node.js and the frontend and backend that were built in the same job.
+# Start it with `gh workflow run build-binary.yml -R <owner>/pingvin-share-x`.
+name: build-binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: launcher/go.sum
+
+      # Same steps as the Dockerfile for the frontend.
+      - name: Build the frontend
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run build
+
+      # Same steps as the Dockerfile for the backend.
+      - name: Build the backend
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx prisma generate
+          npm run build
+          npx tsc prisma/seed/config.seed.ts --outDir dist/prisma/seed --rootDir prisma/seed
+          npm prune --omit=dev
+
+      - name: Assemble the payload
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/payload"
+          rm -rf "$stage"
+          mkdir -p "$stage/node/bin" "$stage/frontend" "$stage/backend"
+          cp "$(command -v node)" "$stage/node/bin/node"
+          cp -a frontend/.next/standalone/. "$stage/frontend/"
+          mkdir -p "$stage/frontend/.next"
+          cp -a frontend/.next/static "$stage/frontend/.next/static"
+          cp -a frontend/public "$stage/frontend/public"
+          cp -a backend/dist backend/node_modules backend/prisma backend/package.json "$stage/backend/"
+          tar -C "$stage" -czf launcher/payload.tar.gz .
+          ls -la launcher/payload.tar.gz
+
+      - name: Test the launcher
+        working-directory: launcher
+        run: go test ./...
+
+      - name: Build the binary
+        working-directory: launcher
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('../backend/package.json').version")+fork.${GITHUB_SHA:0:12}"
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath \
+            -ldflags="-s -w -X main.Version=${version}" -o "$out/pingvin-share-x" .
+          sha256sum "$out/pingvin-share-x" | tee "$out/pingvin-share-x.sha256"
+
+      # Starts the binary on this runner and checks that the app answers on both the API and the page.
+      - name: Smoke test the binary
+        env:
+          BIN: ${{ runner.temp }}/out/pingvin-share-x
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          PINGVIN_HOME="$home" PINGVIN_LISTEN=127.0.0.1:3000 "$BIN" > "$home/server.log" 2>&1 &
+          pid=$!
+          ready=0
+          for _ in $(seq 1 240); do
+            if curl -fsS http://127.0.0.1:3000/api/health >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::the app did not answer /api/health"
+            cat "$home/server.log"
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          page="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/)"
+          echo "GET / -> $page"
+          kill -TERM "$pid"
+          wait "$pid" || true
+          test "$page" = "200"
+          echo "### Smoke test ($ARCH)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- /api/health: ok, GET /: $page" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/out/pingvin-share-x
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingvin-share-x-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
