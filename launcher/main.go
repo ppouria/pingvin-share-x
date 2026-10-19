@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -23,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,11 +38,7 @@ var payload []byte
 // Version is set at build time.
 var Version = "dev"
 
-const (
-	markerName   = ".payload-sha256"
-	backendPort  = "8080"
-	frontendPort = "3333"
-)
+const markerName = ".payload-sha256"
 
 func main() {
 	listen := flag.String("listen", envOr("PINGVIN_LISTEN", ":3000"), "address for the public HTTP port")
@@ -71,7 +69,16 @@ func run(base, listen, payloadSum string) error {
 	if err := unpackIfNeeded(app, data, payloadSum); err != nil {
 		return fmt.Errorf("unpack: %w", err)
 	}
-	env := childEnv(base, data)
+	// The backend and the frontend get free loopback ports, so they never collide with other services.
+	backendPort, err := freePort()
+	if err != nil {
+		return err
+	}
+	frontendPort, err := freePort()
+	if err != nil {
+		return err
+	}
+	env := childEnv(base, data, backendPort)
 	node := filepath.Join(app, "node", "bin", "node")
 	backendDir := filepath.Join(app, "backend")
 	frontendDir := filepath.Join(app, "frontend")
@@ -87,21 +94,21 @@ func run(base, listen, payloadSum string) error {
 	if err != nil {
 		return err
 	}
-	frontendEnv := append(append([]string{}, env...), "PORT="+frontendPort, "HOSTNAME=127.0.0.1", "API_URL=http://127.0.0.1:"+backendPort)
+	frontendEnv := append(append([]string{}, env...), "PORT="+portString(frontendPort), "HOSTNAME=127.0.0.1", "API_URL=http://127.0.0.1:"+portString(backendPort))
 	frontend, err := start("frontend", frontendDir, frontendEnv, node, "server.js")
 	if err != nil {
 		backend.stop()
 		return err
 	}
 
-	if err := waitHealthy("http://127.0.0.1:"+backendPort+"/api/health", 120*time.Second); err != nil {
+	if err := waitHealthy("http://127.0.0.1:"+portString(backendPort)+"/api/health", backend.done, 120*time.Second); err != nil {
 		backend.stop()
 		frontend.stop()
 		return err
 	}
 
 	srv := &http.Server{Addr: listen, Handler: router(
-		mustURL("http://127.0.0.1:"+backendPort), mustURL("http://127.0.0.1:"+frontendPort))}
+		mustURL("http://127.0.0.1:"+portString(backendPort)), mustURL("http://127.0.0.1:"+portString(frontendPort)))}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.ListenAndServe() }()
 	log.Printf("pingvin-share-x listening on %s", listen)
@@ -199,11 +206,11 @@ func unpackIfNeeded(app, data, payloadSum string) error {
 
 // childEnv is the environment for the Node processes. It matches what the Docker image sets, with
 // absolute paths and without the container-only NODE_ENV value.
-func childEnv(base, data string) []string {
+func childEnv(base, data string, backendPort int) []string {
 	env := os.Environ()
 	return append(env,
 		"NODE_ENV=production",
-		"BACKEND_PORT="+backendPort,
+		"BACKEND_PORT="+portString(backendPort),
 		"BACKEND_HOST=127.0.0.1",
 		"DATA_DIRECTORY="+data,
 		"DATABASE_URL=file:"+filepath.Join(data, "pingvin-share.db")+"?connection_limit=1",
@@ -286,10 +293,16 @@ func router(backend, frontend *url.URL) http.Handler {
 	return mux
 }
 
-func waitHealthy(healthURL string, timeout time.Duration) error {
+// waitHealthy polls healthURL until it answers 200. It gives up at once when the backend exits.
+func waitHealthy(healthURL string, backendDone <-chan struct{}, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 3 * time.Second}
 	for time.Now().Before(deadline) {
+		select {
+		case <-backendDone:
+			return fmt.Errorf("the backend exited before it became healthy")
+		default:
+		}
 		resp, err := client.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
@@ -308,6 +321,20 @@ func mustURL(raw string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+// freePort asks the kernel for an unused loopback port.
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func portString(port int) string {
+	return strconv.Itoa(port)
 }
 
 func envOr(name, fallback string) string {
