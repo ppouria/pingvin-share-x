@@ -71,8 +71,11 @@ async function bootstrap() {
     SwaggerModule.setup("api/swagger", app, document);
   }
 
+  // BACKEND_HOST limits the listener to one address, such as 127.0.0.1 behind a reverse proxy.
+  // Unset, Nest listens on every address, as before.
   await app.listen(
     parseInt(process.env.BACKEND_PORT || process.env.PORT || "8080"),
+    process.env.BACKEND_HOST,
   );
 
   const logger = new Logger("UnhandledAsyncError");
