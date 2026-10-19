@@ -55,3 +55,4 @@ yarn-error.log*
 
 # Temp folder for generative work
 /temp/**
+launcher/payload.tar.gz
